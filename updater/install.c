@@ -25,6 +25,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
 
 #include "cutils/misc.h"
 #include "cutils/properties.h"
@@ -76,7 +78,19 @@ Value* MountFn(const char* name, State* state, int argc, Expr* argv[]) {
         goto done;
     }
 
+    char *secontext = NULL;
+
+    if (sehandle) {
+        selabel_lookup(sehandle, &secontext, mount_point, 0755);
+        setfscreatecon(secontext);
+    }
+
     mkdir(mount_point, 0755);
+
+    if (secontext) {
+        freecon(secontext);
+        setfscreatecon(NULL);
+    }
 
     if (strcmp(partition_type, "MTD") == 0) {
         mtd_scan_partitions();
@@ -174,19 +188,25 @@ done:
 }
 
 
-// format(fs_type, partition_type, location)
+// format(fs_type, partition_type, location, fs_size, mount_point)
 //
-//    fs_type="yaffs2" partition_type="MTD"     location=partition
-//    fs_type="ext4"   partition_type="EMMC"    location=device
+//    fs_type="yaffs2" partition_type="MTD"     location=partition fs_size=<bytes> mount_point=<location>
+//    fs_type="ext4"   partition_type="EMMC"    location=device    fs_size=<bytes> mount_point=<location>
+//    if fs_size == 0, then make_ext4fs uses the entire partition.
+//    if fs_size > 0, that is the size to use
+//    if fs_size < 0, then reserve that many bytes at the end of the partition
 Value* FormatFn(const char* name, State* state, int argc, Expr* argv[]) {
     char* result = NULL;
-    if (argc != 3) {
-        return ErrorAbort(state, "%s() expects 3 args, got %d", name, argc);
+    if (argc != 5) {
+        return ErrorAbort(state, "%s() expects 5 args, got %d", name, argc);
     }
     char* fs_type;
     char* partition_type;
     char* location;
-    if (ReadArgs(state, argv, 3, &fs_type, &partition_type, &location) < 0) {
+    char* fs_size;
+    char* mount_point;
+
+    if (ReadArgs(state, argv, 5, &fs_type, &partition_type, &location, &fs_size, &mount_point) < 0) {
         return NULL;
     }
 
@@ -201,6 +221,11 @@ Value* FormatFn(const char* name, State* state, int argc, Expr* argv[]) {
     }
     if (strlen(location) == 0) {
         ErrorAbort(state, "location argument to %s() can't be empty", name);
+        goto done;
+    }
+
+    if (strlen(mount_point) == 0) {
+        ErrorAbort(state, "mount_point argument to %s() can't be empty", name);
         goto done;
     }
 
@@ -233,8 +258,7 @@ Value* FormatFn(const char* name, State* state, int argc, Expr* argv[]) {
         result = location;
 #ifdef USE_EXT4
     } else if (strcmp(fs_type, "ext4") == 0) {
-        reset_ext4fs_info();
-        int status = make_ext4fs(location, NULL, NULL, 0, 0, 0);
+        int status = make_ext4fs(location, atoll(fs_size), mount_point, sehandle);
         if (status != 0) {
             fprintf(stderr, "%s: make_ext4fs failed (%d) on %s",
                     name, status, location);
@@ -341,7 +365,7 @@ Value* PackageExtractDirFn(const char* name, State* state,
 
     bool success = mzExtractRecursive(za, zip_path, dest_path,
                                       MZ_EXTRACT_FILES_ONLY, &timestamp,
-                                      NULL, NULL);
+                                      NULL, NULL, sehandle);
     free(zip_path);
     free(dest_path);
     return StringValue(strdup(success ? "t" : ""));
@@ -428,6 +452,26 @@ Value* PackageExtractFileFn(const char* name, State* state,
     }
 }
 
+// Create all parent directories of name, if necessary.
+static int make_parents(char* name) {
+    char* p;
+    for (p = name + (strlen(name)-1); p > name; --p) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (make_parents(name) < 0) return -1;
+        int result = mkdir(name, 0700);
+        if (result == 0) fprintf(stderr, "symlink(): created [%s]\n", name);
+        *p = '/';
+        if (result == 0 || errno == EEXIST) {
+            // successfully created or already existed; we're done
+            return 0;
+        } else {
+            fprintf(stderr, "failed to mkdir %s: %s\n", name, strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
 
 // symlink target src1 src2 ...
 //    unlinks any previously existing src1, src2, etc before creating symlinks.
@@ -445,21 +489,32 @@ Value* SymlinkFn(const char* name, State* state, int argc, Expr* argv[]) {
         return NULL;
     }
 
+    int bad = 0;
     int i;
     for (i = 0; i < argc-1; ++i) {
         if (unlink(srcs[i]) < 0) {
             if (errno != ENOENT) {
                 fprintf(stderr, "%s: failed to remove %s: %s\n",
                         name, srcs[i], strerror(errno));
+                ++bad;
             }
+        }
+        if (make_parents(srcs[i])) {
+            fprintf(stderr, "%s: failed to symlink %s to %s: making parents failed\n",
+                    name, srcs[i], target);
+            ++bad;
         }
         if (symlink(target, srcs[i]) < 0) {
             fprintf(stderr, "%s: failed to symlink %s to %s: %s\n",
                     name, srcs[i], target, strerror(errno));
+            ++bad;
         }
         free(srcs[i]);
     }
     free(srcs);
+    if (bad) {
+        return ErrorAbort(state, "%s: some symlinks failed", name);
+    }
     return StringValue(strdup(""));
 }
 
@@ -470,7 +525,8 @@ Value* SetPermFn(const char* name, State* state, int argc, Expr* argv[]) {
 
     int min_args = 4 + (recursive ? 1 : 0);
     if (argc < min_args) {
-        return ErrorAbort(state, "%s() expects %d+ args, got %d", name, argc);
+        return ErrorAbort(state, "%s() expects %d+ args, got %d",
+                          name, min_args, argc);
     }
 
     char** args = ReadVarArgs(state, argc, argv);
@@ -478,6 +534,7 @@ Value* SetPermFn(const char* name, State* state, int argc, Expr* argv[]) {
 
     char* end;
     int i;
+    int bad = 0;
 
     int uid = strtoul(args[0], &end, 0);
     if (*end != '\0' || args[0][0] == 0) {
@@ -519,10 +576,12 @@ Value* SetPermFn(const char* name, State* state, int argc, Expr* argv[]) {
             if (chown(args[i], uid, gid) < 0) {
                 fprintf(stderr, "%s: chown of %s to %d %d failed: %s\n",
                         name, args[i], uid, gid, strerror(errno));
+                ++bad;
             }
             if (chmod(args[i], mode) < 0) {
                 fprintf(stderr, "%s: chmod of %s to %o failed: %s\n",
                         name, args[i], mode, strerror(errno));
+                ++bad;
             }
         }
     }
@@ -534,6 +593,10 @@ done:
     }
     free(args);
 
+    if (bad) {
+        free(result);
+        return ErrorAbort(state, "%s: some changes failed", name);
+    }
     return StringValue(result);
 }
 
@@ -585,7 +648,7 @@ Value* FileGetPropFn(const char* name, State* state, int argc, Expr* argv[]) {
 
     buffer = malloc(st.st_size+1);
     if (buffer == NULL) {
-        ErrorAbort(state, "%s: failed to alloc %d bytes", name, st.st_size+1);
+        ErrorAbort(state, "%s: failed to alloc %lld bytes", name, st.st_size+1);
         goto done;
     }
 
@@ -597,7 +660,7 @@ Value* FileGetPropFn(const char* name, State* state, int argc, Expr* argv[]) {
     }
 
     if (fread(buffer, 1, st.st_size, f) != st.st_size) {
-        ErrorAbort(state, "%s: failed to read %d bytes from %s",
+        ErrorAbort(state, "%s: failed to read %lld bytes from %s",
                    name, st.st_size+1, filename);
         fclose(f);
         goto done;
@@ -661,21 +724,27 @@ static bool write_raw_image_cb(const unsigned char* data,
     return false;
 }
 
-// write_raw_image(file, partition)
+// write_raw_image(filename_or_blob, partition)
 Value* WriteRawImageFn(const char* name, State* state, int argc, Expr* argv[]) {
     char* result = NULL;
 
-    char* partition;
-    char* filename;
-    if (ReadArgs(state, argv, 2, &filename, &partition) < 0) {
+    Value* partition_value;
+    Value* contents;
+    if (ReadValueArgs(state, argv, 2, &contents, &partition_value) < 0) {
         return NULL;
     }
 
+    char* partition = NULL;
+    if (partition_value->type != VAL_STRING) {
+        ErrorAbort(state, "partition argument to %s must be string", name);
+        goto done;
+    }
+    partition = partition_value->data;
     if (strlen(partition) == 0) {
         ErrorAbort(state, "partition argument to %s can't be empty", name);
         goto done;
     }
-    if (strlen(filename) == 0) {
+    if (contents->type == VAL_STRING && strlen((char*) contents->data) == 0) {
         ErrorAbort(state, "file argument to %s can't be empty", name);
         goto done;
     }
@@ -698,27 +767,35 @@ Value* WriteRawImageFn(const char* name, State* state, int argc, Expr* argv[]) {
 
     bool success;
 
-    FILE* f = fopen(filename, "rb");
-    if (f == NULL) {
-        fprintf(stderr, "%s: can't open %s: %s\n",
-                name, filename, strerror(errno));
-        result = strdup("");
-        goto done;
-    }
-
-    success = true;
-    char* buffer = malloc(BUFSIZ);
-    int read;
-    while (success && (read = fread(buffer, 1, BUFSIZ, f)) > 0) {
-        int wrote = mtd_write_data(ctx, buffer, read);
-        success = success && (wrote == read);
-        if (!success) {
-            fprintf(stderr, "mtd_write_data to %s failed: %s\n",
-                    partition, strerror(errno));
+    if (contents->type == VAL_STRING) {
+        // we're given a filename as the contents
+        char* filename = contents->data;
+        FILE* f = fopen(filename, "rb");
+        if (f == NULL) {
+            fprintf(stderr, "%s: can't open %s: %s\n",
+                    name, filename, strerror(errno));
+            result = strdup("");
+            goto done;
         }
+
+        success = true;
+        char* buffer = malloc(BUFSIZ);
+        int read;
+        while (success && (read = fread(buffer, 1, BUFSIZ, f)) > 0) {
+            int wrote = mtd_write_data(ctx, buffer, read);
+            success = success && (wrote == read);
+        }
+        free(buffer);
+        fclose(f);
+    } else {
+        // we're given a blob as the contents
+        ssize_t wrote = mtd_write_data(ctx, contents->data, contents->size);
+        success = (wrote == contents->size);
     }
-    free(buffer);
-    fclose(f);
+    if (!success) {
+        fprintf(stderr, "mtd_write_data to %s failed: %s\n",
+                partition, strerror(errno));
+    }
 
     if (mtd_erase_blocks(ctx, -1) == -1) {
         fprintf(stderr, "%s: error erasing blocks of %s\n", name, partition);
@@ -727,14 +804,14 @@ Value* WriteRawImageFn(const char* name, State* state, int argc, Expr* argv[]) {
         fprintf(stderr, "%s: error closing write of %s\n", name, partition);
     }
 
-    printf("%s %s partition from %s\n",
-           success ? "wrote" : "failed to write", partition, filename);
+    printf("%s %s partition\n",
+           success ? "wrote" : "failed to write", partition);
 
     result = success ? partition : strdup("");
 
 done:
-    if (result != partition) free(partition);
-    free(filename);
+    if (result != partition) FreeValue(partition_value);
+    FreeValue(contents);
     return StringValue(result);
 }
 
@@ -820,7 +897,7 @@ Value* ApplyPatchFn(const char* name, State* state, int argc, Expr* argv[]) {
 
     int result = applypatch(source_filename, target_filename,
                             target_sha1, target_size,
-                            patchcount, patch_sha_str, patches);
+                            patchcount, patch_sha_str, patches, NULL);
 
     for (i = 0; i < patchcount; ++i) {
         FreeValue(patches[i]);
@@ -888,6 +965,14 @@ Value* UIPrintFn(const char* name, State* state, int argc, Expr* argv[]) {
     fprintf(((UpdaterInfo*)(state->cookie))->cmd_pipe, "ui_print\n");
 
     return StringValue(buffer);
+}
+
+Value* WipeCacheFn(const char* name, State* state, int argc, Expr* argv[]) {
+    if (argc != 0) {
+        return ErrorAbort(state, "%s() expects no args, got %d", name, argc);
+    }
+    fprintf(((UpdaterInfo*)(state->cookie))->cmd_pipe, "wipe_cache\n");
+    return StringValue(strdup("t"));
 }
 
 Value* RunProgramFn(const char* name, State* state, int argc, Expr* argv[]) {
@@ -1007,7 +1092,7 @@ Value* Sha1CheckFn(const char* name, State* state, int argc, Expr* argv[]) {
     return args[i];
 }
 
-// Read a local file and return its contents (the char* returned
+// Read a local file and return its contents (the Value* returned
 // is actually a FileContents*).
 Value* ReadFileFn(const char* name, State* state, int argc, Expr* argv[]) {
     if (argc != 1) {
@@ -1020,7 +1105,7 @@ Value* ReadFileFn(const char* name, State* state, int argc, Expr* argv[]) {
     v->type = VAL_BLOB;
 
     FileContents fc;
-    if (LoadFileContents(filename, &fc) != 0) {
+    if (LoadFileContents(filename, &fc, RETOUCH_DONT_MASK) != 0) {
         ErrorAbort(state, "%s() loading \"%s\" failed: %s",
                    name, filename, strerror(errno));
         free(filename);
@@ -1061,6 +1146,8 @@ void RegisterInstallFunctions() {
 
     RegisterFunction("read_file", ReadFileFn);
     RegisterFunction("sha1_check", Sha1CheckFn);
+
+    RegisterFunction("wipe_cache", WipeCacheFn);
 
     RegisterFunction("ui_print", UIPrintFn);
 

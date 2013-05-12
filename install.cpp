@@ -32,13 +32,22 @@
 #include "mtdutils/mtdutils.h"
 #include "roots.h"
 #include "verifier.h"
+#include "ui.h"
+
+extern RecoveryUI* ui;
 
 #define ASSUMED_UPDATE_BINARY_NAME  "META-INF/com/google/android/update-binary"
 #define PUBLIC_KEYS_FILE "/res/keys"
 
+// Default allocation of progress bar segments to operations
+static const int VERIFICATION_PROGRESS_TIME = 60;
+static const float VERIFICATION_PROGRESS_FRACTION = 0.25;
+static const float DEFAULT_FILES_PROGRESS_FRACTION = 0.4;
+static const float DEFAULT_IMAGE_PROGRESS_FRACTION = 0.1;
+
 // If the package contains an update binary, extract it and run it.
 static int
-try_update_binary(const char *path, ZipArchive *zip) {
+try_update_binary(const char *path, ZipArchive *zip, int* wipe_cache) {
     const ZipEntry* binary_entry =
             mzFindZipEntry(zip, ASSUMED_UPDATE_BINARY_NAME);
     if (binary_entry == NULL) {
@@ -46,13 +55,13 @@ try_update_binary(const char *path, ZipArchive *zip) {
         return INSTALL_CORRUPT;
     }
 
-    char* binary = "/tmp/update_binary";
+    const char* binary = "/tmp/update_binary";
     unlink(binary);
     int fd = creat(binary, 0755);
     if (fd < 0) {
         mzCloseZipArchive(zip);
         LOGE("Can't make %s\n", binary);
-        return 1;
+        return INSTALL_ERROR;
     }
     bool ok = mzExtractZipEntryToFile(zip, binary_entry, fd);
     close(fd);
@@ -60,7 +69,7 @@ try_update_binary(const char *path, ZipArchive *zip) {
 
     if (!ok) {
         LOGE("Can't copy %s\n", ASSUMED_UPDATE_BINARY_NAME);
-        return 1;
+        return INSTALL_ERROR;
     }
 
     int pipefd[2];
@@ -100,22 +109,25 @@ try_update_binary(const char *path, ZipArchive *zip) {
     //   - the name of the package zip file.
     //
 
-    char** args = malloc(sizeof(char*) * 5);
+    const char** args = (const char**)malloc(sizeof(char*) * 5);
     args[0] = binary;
     args[1] = EXPAND(RECOVERY_API_VERSION);   // defined in Android.mk
-    args[2] = malloc(10);
-    sprintf(args[2], "%d", pipefd[1]);
+    char* temp = (char*)malloc(10);
+    sprintf(temp, "%d", pipefd[1]);
+    args[2] = temp;
     args[3] = (char*)path;
     args[4] = NULL;
 
     pid_t pid = fork();
     if (pid == 0) {
         close(pipefd[0]);
-        execv(binary, args);
+        execv(binary, (char* const*)args);
         fprintf(stdout, "E:Can't run %s (%s)\n", binary, strerror(errno));
         _exit(-1);
     }
     close(pipefd[1]);
+
+    *wipe_cache = 0;
 
     char buffer[1024];
     FILE* from_child = fdopen(pipefd[0], "r");
@@ -130,19 +142,22 @@ try_update_binary(const char *path, ZipArchive *zip) {
             float fraction = strtof(fraction_s, NULL);
             int seconds = strtol(seconds_s, NULL, 10);
 
-            ui_show_progress(fraction * (1-VERIFICATION_PROGRESS_FRACTION),
-                             seconds);
+            ui->ShowProgress(fraction * (1-VERIFICATION_PROGRESS_FRACTION), seconds);
         } else if (strcmp(command, "set_progress") == 0) {
             char* fraction_s = strtok(NULL, " \n");
             float fraction = strtof(fraction_s, NULL);
-            ui_set_progress(fraction);
+            ui->SetProgress(fraction);
         } else if (strcmp(command, "ui_print") == 0) {
             char* str = strtok(NULL, "\n");
             if (str) {
-                ui_print("%s", str);
+                ui->Print("%s", str);
             } else {
-                ui_print("\n");
+                ui->Print("\n");
             }
+        } else if (strcmp(command, "wipe_cache") == 0) {
+            *wipe_cache = 1;
+        } else if (strcmp(command, "clear_display") == 0) {
+            ui->SetBackground(RecoveryUI::NONE);
         } else {
             LOGE("unknown command [%s]\n", command);
         }
@@ -165,6 +180,12 @@ try_update_binary(const char *path, ZipArchive *zip) {
 //
 //  "{64,0xc926ad21,{1795090719,...,-695002876},{-857949815,...,1175080310}}"
 //
+// For key versions newer than the original 2048-bit e=3 keys
+// supported by Android, the string is preceded by a version
+// identifier, eg:
+//
+//  "v2 {64,0xc926ad21,{1795090719,...,-695002876},{-857949815,...,1175080310}}"
+//
 // (Note that the braces and commas in this example are actual
 // characters the parser expects to find in the file; the ellipses
 // indicate more numbers omitted from this example.)
@@ -184,31 +205,48 @@ load_keys(const char* filename, int* numKeys) {
         goto exit;
     }
 
-    int i;
-    bool done = false;
-    while (!done) {
-        ++*numKeys;
-        out = realloc(out, *numKeys * sizeof(RSAPublicKey));
-        RSAPublicKey* key = out + (*numKeys - 1);
-        if (fscanf(f, " { %i , 0x%x , { %u",
-                   &(key->len), &(key->n0inv), &(key->n[0])) != 3) {
-            goto exit;
-        }
-        if (key->len != RSANUMWORDS) {
-            LOGE("key length (%d) does not match expected size\n", key->len);
-            goto exit;
-        }
-        for (i = 1; i < key->len; ++i) {
-            if (fscanf(f, " , %u", &(key->n[i])) != 1) goto exit;
-        }
-        if (fscanf(f, " } , { %u", &(key->rr[0])) != 1) goto exit;
-        for (i = 1; i < key->len; ++i) {
-            if (fscanf(f, " , %u", &(key->rr[i])) != 1) goto exit;
-        }
-        fscanf(f, " } } ");
+    {
+        int i;
+        bool done = false;
+        while (!done) {
+            ++*numKeys;
+            out = (RSAPublicKey*)realloc(out, *numKeys * sizeof(RSAPublicKey));
+            RSAPublicKey* key = out + (*numKeys - 1);
 
-        // if the line ends in a comma, this file has more keys.
-        switch (fgetc(f)) {
+            char start_char;
+            if (fscanf(f, " %c", &start_char) != 1) goto exit;
+            if (start_char == '{') {
+                // a version 1 key has no version specifier.
+                key->exponent = 3;
+            } else if (start_char == 'v') {
+                int version;
+                if (fscanf(f, "%d {", &version) != 1) goto exit;
+                if (version == 2) {
+                    key->exponent = 65537;
+                } else {
+                    goto exit;
+                }
+            }
+
+            if (fscanf(f, " %i , 0x%x , { %u",
+                       &(key->len), &(key->n0inv), &(key->n[0])) != 3) {
+                goto exit;
+            }
+            if (key->len != RSANUMWORDS) {
+                LOGE("key length (%d) does not match expected size\n", key->len);
+                goto exit;
+            }
+            for (i = 1; i < key->len; ++i) {
+                if (fscanf(f, " , %u", &(key->n[i])) != 1) goto exit;
+            }
+            if (fscanf(f, " } , { %u", &(key->rr[0])) != 1) goto exit;
+            for (i = 1; i < key->len; ++i) {
+                if (fscanf(f, " , %u", &(key->rr[i])) != 1) goto exit;
+            }
+            fscanf(f, " } } ");
+
+            // if the line ends in a comma, this file has more keys.
+            switch (fgetc(f)) {
             case ',':
                 // more keys to come.
                 break;
@@ -220,6 +258,9 @@ load_keys(const char* filename, int* numKeys) {
             default:
                 LOGE("unexpected character between keys\n");
                 goto exit;
+            }
+
+            LOGI("read key e=%d\n", key->exponent);
         }
     }
 
@@ -233,12 +274,12 @@ exit:
     return NULL;
 }
 
-int
-install_package(const char *path)
+static int
+really_install_package(const char *path, int* wipe_cache)
 {
-    ui_set_background(BACKGROUND_ICON_INSTALLING);
-    ui_print("Finding update package...\n");
-    ui_show_indeterminate_progress();
+    ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
+    ui->Print("Finding update package...\n");
+    ui->SetProgressType(RecoveryUI::INDETERMINATE);
     LOGI("Update location: %s\n", path);
 
     if (ensure_path_mounted(path) != 0) {
@@ -246,7 +287,7 @@ install_package(const char *path)
         return INSTALL_CORRUPT;
     }
 
-    ui_print("Opening update package...\n");
+    ui->Print("Opening update package...\n");
 
     int numKeys;
     RSAPublicKey* loadedKeys = load_keys(PUBLIC_KEYS_FILE, &numKeys);
@@ -257,10 +298,9 @@ install_package(const char *path)
     LOGI("%d key(s) loaded from %s\n", numKeys, PUBLIC_KEYS_FILE);
 
     // Give verification half the progress bar...
-    ui_print("Verifying update package...\n");
-    ui_show_progress(
-            VERIFICATION_PROGRESS_FRACTION,
-            VERIFICATION_PROGRESS_TIME);
+    ui->Print("Verifying update package...\n");
+    ui->SetProgressType(RecoveryUI::DETERMINATE);
+    ui->ShowProgress(VERIFICATION_PROGRESS_FRACTION, VERIFICATION_PROGRESS_TIME);
 
     int err;
     err = verify_file(path, loadedKeys, numKeys);
@@ -282,6 +322,25 @@ install_package(const char *path)
 
     /* Verify and install the contents of the package.
      */
-    ui_print("Installing update...\n");
-    return try_update_binary(path, &zip);
+    ui->Print("Installing update...\n");
+    return try_update_binary(path, &zip, wipe_cache);
+}
+
+int
+install_package(const char* path, int* wipe_cache, const char* install_file)
+{
+    FILE* install_log = fopen_path(install_file, "w");
+    if (install_log) {
+        fputs(path, install_log);
+        fputc('\n', install_log);
+    } else {
+        LOGE("failed to open last_install: %s\n", strerror(errno));
+    }
+    int result = really_install_package(path, wipe_cache);
+    if (install_log) {
+        fputc(result == INSTALL_SUCCESS ? '1' : '0', install_log);
+        fputc('\n', install_log);
+        fclose(install_log);
+    }
+    return result;
 }
